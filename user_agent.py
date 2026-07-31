@@ -1,228 +1,184 @@
-"""Competition entry point for the Math-Agent demo.
-
-The evaluator imports ``ReasoningAgent`` from this file and calls:
-
-    agent = ReasoningAgent(client=official_client)
-    agent.solve(problem: str, metadata: dict) -> dict
-
-Keep this file free of hard-coded secrets and absolute paths.
-"""
-
-from __future__ import annotations
-
-import json
-import os
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Tuple
 
-from utils.answer_utils import extract_final_answer, normalize_final_answer
-from utils.prompt_loader import load_prompt
+from lagent.agents import Agent
+from lagent.schema import AgentMessage
+
+from llm_client import InternChatClient
+
+
+# ==================== PARTICIPANT DESIGN AREA START ====================
+
+POLICY_PROMPT = """你是一个严谨的数学推理智能体。
+请解决用户给出的数学问题，并给出清晰推理与最终答案。
+
+要求：
+1. 先分析题意和关键条件。
+2. 给出必要的推导步骤。
+3. 在最后明确写出最终答案。
+"""
+
+VERIFIER_PROMPT = """你是一个数学答案验证器。
+请判断候选解答是否正确解决了题目。
+
+不要输出解释。只输出以下两行之一：
+VERDICT: A
+或
+VERDICT: B
+
+其中 A 表示候选解答正确，B 表示候选解答错误。
+"""
 
 
 @dataclass
-class Candidate:
-    answer: str
-    reasoning_summary: str
-    raw_response: str
+class AgentConfig:
+    policy_sample_times: int = 3
+    verifier_voting_times: int = 2
+    policy_temperature: float = 0.6
+    verifier_temperature: float = 0.0
+    max_tokens: int = 4096
 
 
 class ReasoningAgent:
-    """Math reasoning agent with a fixed competition-compatible interface."""
+    """A simple lagent-based generate-verify-select baseline agent."""
 
-    def __init__(self, client, *args, **kwargs):
-        self.client = client
-        self.model_name = kwargs.get("model_name", "")
-        self.system_prompt = load_prompt("math_system.txt")
-        self.solver_prompt = load_prompt("solver_prompt.txt")
-        self.verifier_prompt = load_prompt("verifier_prompt.txt")
-        self.solve_temperature = _get_float_env("AGENT_SOLVE_TEMPERATURE", 0.2)
-        self.verify_temperature = _get_float_env("AGENT_VERIFY_TEMPERATURE", 0.0)
-        self.solve_max_tokens = _get_int_env("AGENT_SOLVE_MAX_TOKENS", 4096)
-        self.verify_max_tokens = _get_int_env("AGENT_VERIFY_MAX_TOKENS", 2048)
+    def __init__(self, client: InternChatClient, config: AgentConfig | None = None) -> None:
+        self.config = config or AgentConfig()
+        self.policy_agent = Agent(
+            llm=client,
+            template=POLICY_PROMPT,
+            name="policy_agent",
+        )
+        self.verifier_agent = Agent(
+            llm=client,
+            template=VERIFIER_PROMPT,
+            name="verifier_agent",
+        )
 
-    def solve(self, problem: str, metadata: dict) -> dict:
-        trace: List[Dict[str, str]] = []
+    def solve(self, problem: str, metadata: Dict) -> Dict:
+        idx = metadata.get("idx", 0)
+        candidates, trace = self._generate_candidates(problem, idx)
+        scored_candidates = []
 
-        if not isinstance(problem, str) or not problem.strip():
-            return {
-                "final_response": "无法解析题目",
-                "trace": [{"step": "input_check", "content": "problem为空或类型非法"}],
-            }
+        for candidate_id, candidate in enumerate(candidates):
+            confidence, verify_trace = self._verify_candidate(
+                problem,
+                candidate,
+                idx,
+                candidate_id,
+            )
+            scored_candidates.append(
+                {
+                    "content": candidate,
+                    "confidence_score": confidence,
+                }
+            )
+            trace.extend(verify_trace)
 
-        metadata = metadata or {}
+        best = max(scored_candidates, key=lambda item: item["confidence_score"])
         trace.append(
             {
-                "step": "plan",
-                "content": "构造数学解题提示词，生成候选答案，再进行答案抽取和格式规整。",
+                "step": "select_final_response",
+                "content": f"Selected candidate with confidence {best['confidence_score']:.3f}.",
             }
         )
+        return {
+            "final_response": best["content"],
+            "trace": trace,
+        }
 
-        try:
-            primary = self._generate_solution(
-                problem,
-                metadata,
-                temperature=self.solve_temperature,
-                max_tokens=self.solve_max_tokens,
+    def _generate_candidates(self, problem: str, idx: int) -> Tuple[List[str], List[Dict]]:
+        candidates = []
+        trace = []
+        for sample_id in range(self.config.policy_sample_times):
+            user_message = AgentMessage(
+                sender="user",
+                content=f"题目：\n{problem}\n\n请给出完整解答。候选编号：{sample_id}",
             )
-            candidates = [primary]
+            response = self.policy_agent(
+                user_message,
+                session_id=f"{idx}:policy:{sample_id}",
+                temperature=self.config.policy_temperature,
+                max_tokens=self.config.max_tokens,
+            )
+            candidates.append(response.content)
             trace.append(
                 {
-                    "step": "primary_candidate",
-                    "content": self._short_trace(primary.reasoning_summary),
+                    "step": f"policy_call_{sample_id}",
+                    "content": {
+                        "message": user_message.content,
+                        "response": response.content,
+                    },
                 }
             )
-
-            # A low-cost second pass is useful for formatting and catching obvious slips.
-            verified = self._verify_candidate(problem, metadata, primary)
-            if verified:
-                candidates.append(verified)
-                trace.append(
-                    {
-                        "step": "verification_candidate",
-                        "content": self._short_trace(verified.reasoning_summary),
-                    }
-                )
-
-            selected = self._select_candidate(candidates)
-            final_response = normalize_final_answer(selected.answer)
-            if not final_response:
-                final_response = normalize_final_answer(
-                    extract_final_answer(selected.raw_response)
-                )
-
-            trace.append(
-                {
-                    "step": "finalize",
-                    "content": f"最终答案规整为：{final_response}",
-                }
-            )
-
-            return {
-                "final_response": final_response or "无法确定",
-                "trace": trace,
-            }
-        except Exception as exc:  # Keep evaluator calls from crashing the runner.
-            trace.append({"step": "error", "content": f"{type(exc).__name__}: {exc}"})
-            return {
-                "final_response": "无法确定",
-                "trace": trace,
-            }
-
-    def _generate_solution(
-        self,
-        problem: str,
-        metadata: dict,
-        temperature: float = 0.2,
-        max_tokens: int = 4096,
-    ) -> Candidate:
-        prompt = self.solver_prompt.format(
-            problem=problem.strip(),
-            metadata=json.dumps(metadata, ensure_ascii=False),
-        )
-        response = self._chat(prompt, temperature=temperature, max_tokens=max_tokens)
-        return Candidate(
-            answer=extract_final_answer(response),
-            reasoning_summary=response,
-            raw_response=response,
-        )
+        return candidates, trace
 
     def _verify_candidate(
-        self, problem: str, metadata: dict, candidate: Candidate
-    ) -> Optional[Candidate]:
-        prompt = self.verifier_prompt.format(
-            problem=problem.strip(),
-            metadata=json.dumps(metadata, ensure_ascii=False),
-            candidate_answer=candidate.answer,
-            candidate_solution=candidate.raw_response,
-        )
-        response = self._chat(
-            prompt,
-            temperature=self.verify_temperature,
-            max_tokens=self.verify_max_tokens,
-        )
-        answer = extract_final_answer(response)
-        if not answer:
-            return None
-        return Candidate(answer=answer, reasoning_summary=response, raw_response=response)
+        self,
+        problem: str,
+        candidate: str,
+        idx: int,
+        candidate_id: int,
+    ) -> Tuple[float, List[Dict]]:
+        votes = []
+        trace = []
+        for vote_id in range(self.config.verifier_voting_times):
+            user_message = AgentMessage(
+                sender="user",
+                content=(
+                    "题目：\n"
+                    f"{problem}\n\n"
+                    "候选解答：\n"
+                    f"{candidate}\n\n"
+                    "请判断候选解答是否正确。\n"
+                    "只输出一行：VERDICT: A 或 VERDICT: B。"
+                ),
+            )
+            response = self.verifier_agent(
+                user_message,
+                session_id=f"{idx}:verify:{candidate_id}:{vote_id}",
+                temperature=self.config.verifier_temperature,
+                max_tokens=1024,
+            )
+            verdict = response.content
+            votes.append(self._is_correct_vote(verdict))
+            trace.append(
+                {
+                    "step": f"verifier_call_{candidate_id}_{vote_id}",
+                    "content": {
+                        "candidate_id": candidate_id,
+                        "message": user_message.content,
+                        "response": verdict,
+                    },
+                }
+            )
 
-    def _select_candidate(self, candidates: List[Candidate]) -> Candidate:
-        normalized_counts: Dict[str, int] = {}
-        for candidate in candidates:
-            normalized = normalize_final_answer(candidate.answer)
-            if normalized:
-                normalized_counts[normalized] = normalized_counts.get(normalized, 0) + 1
-
-        if normalized_counts:
-            best_answer = max(
-                normalized_counts.items(), key=lambda item: (item[1], len(item[0]))
-            )[0]
-            for candidate in reversed(candidates):
-                if normalize_final_answer(candidate.answer) == best_answer:
-                    return candidate
-
-        return candidates[0]
-
-    def _chat(self, user_prompt: str, temperature: float, max_tokens: int) -> str:
-        messages = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-        response = self.client.chat(
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-        return self._extract_client_text(response)
+        confidence = sum(votes) / len(votes) if votes else 0.0
+        return confidence, trace
 
     @staticmethod
-    def _extract_client_text(response: Any) -> str:
-        if isinstance(response, str):
-            return response
-        if isinstance(response, dict):
-            content = response.get("content")
-            if isinstance(content, list):
-                texts = [
-                    item.get("text", "")
-                    for item in content
-                    if isinstance(item, dict) and item.get("type") == "text"
-                ]
-                if texts:
-                    return "\n".join(texts)
-            if isinstance(content, str):
-                return content
-            if isinstance(response.get("text"), str):
-                return response["text"]
-            choices = response.get("choices")
-            if choices and isinstance(choices, list):
-                first = choices[0]
-                if isinstance(first, dict):
-                    message = first.get("message", {})
-                    if isinstance(message, dict) and isinstance(
-                        message.get("content"), str
-                    ):
-                        return message["content"]
-                    if isinstance(first.get("text"), str):
-                        return first["text"]
-        return str(response)
+    def _is_correct_vote(verdict: str) -> bool:
+        verdict_matches = re.findall(
+            r"\bVERDICT\s*[:：]\s*([AB])\s*[。.]?",
+            verdict,
+            flags=re.IGNORECASE,
+        )
+        if verdict_matches:
+            return verdict_matches[-1].upper() == "A"
 
-    @staticmethod
-    def _short_trace(text: str, limit: int = 500) -> str:
-        compact = re.sub(r"\s+", " ", text).strip()
-        if len(compact) <= limit:
-            return compact
-        return compact[: limit - 3] + "..."
+        label_matches = re.findall(
+            r"^\s*([AB])\s*[。.]?\s*$",
+            verdict,
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+        if label_matches:
+            return label_matches[-1].upper() == "A"
+
+        words = re.findall(r"\b[A-Z]+\b", verdict.upper())
+        if "INCORRECT" in words:
+            return False
+        return "CORRECT" in words
 
 
-def _get_int_env(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)))
-    except ValueError:
-        return default
-
-
-def _get_float_env(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, str(default)))
-    except ValueError:
-        return default
+# ===================== PARTICIPANT DESIGN AREA END =====================

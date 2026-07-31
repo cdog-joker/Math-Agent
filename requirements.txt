@@ -1,4 +1,9 @@
-# The core demo only uses Python standard library modules.
-# Add optional packages here as the agent grows, for example:
-# sympy>=1.13.0
-# pytest>=8.0.0
+requests>=2.31.0
+lagent @ git+https://github.com/InternLM/lagent.git@0ab2e2f550477884743cd63fbca7bc4aa7b00290
+openai
+anthropic
+aiohttp
+asyncache
+asyncer
+tenacity
+ray

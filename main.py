@@ -1,88 +1,123 @@
-"""Local JSONL runner for the competition agent."""
-
-from __future__ import annotations
-
 import argparse
-import traceback
+import asyncio
+import json
+import os
 from pathlib import Path
+from typing import Dict, List
 
-from llm_client import build_local_client
+from llm_client import InternChatClient
 from user_agent import ReasoningAgent
-from utils.jsonl import read_jsonl, write_json
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Run ReasoningAgent on a JSONL file.")
-    parser.add_argument(
-        "--input_file",
-        default="sample_data/dev.jsonl",
-        help="Path to JSONL input. Each line must include idx and problem.",
-    )
-    parser.add_argument(
-        "--output_dir",
-        default="sample_outputs",
-        help="Directory where per-problem JSON outputs are written.",
-    )
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Recompute outputs even when idx.json already exists and is non-empty.",
-    )
+LOCAL_MAX_CONCURRENCY = int(os.environ.get("LOCAL_MAX_CONCURRENCY", "8"))
+
+
+def load_jsonl(path: Path) -> List[Dict]:
+    items = []
+    with path.open("r", encoding="utf-8") as file:
+        for line_number, line in enumerate(file):
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            item.setdefault("idx", line_number)
+            items.append(item)
+    return items
+
+
+def result_path(output_dir: Path, item: Dict) -> Path:
+    return output_dir / f"{item['idx']}.json"
+
+
+def is_processed(path: Path) -> bool:
+    return path.exists() and path.stat().st_size > 0
+
+
+def write_json(path: Path, record: Dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as file:
+        json.dump(record, file, ensure_ascii=False, indent=2)
+        file.write("\n")
+    tmp_path.replace(path)
+
+
+def build_output_record(item: Dict, agent_result: Dict) -> Dict:
+    final_response = agent_result.get("final_response", "")
+    if not isinstance(final_response, str) or not final_response.strip():
+        raise ValueError("agent.solve must return a non-empty string field: final_response")
+
+    output = {
+        "idx": item["idx"],
+        "status": "success",
+        "final_response": final_response,
+        "trace": agent_result.get("trace", []),
+    }
+    return output
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Competition sample reasoning agent.")
+    parser.add_argument("--input_file", required=True, help="Path to input JSONL.")
+    parser.add_argument("--output_dir", required=True, help="Directory for per-problem JSON outputs.")
     return parser.parse_args()
 
 
-def main() -> int:
-    args = parse_args()
-    output_dir = Path(args.output_dir)
-    client = build_local_client()
-    agent = ReasoningAgent(client=client)
+def solve_item(agent: ReasoningAgent, item: Dict) -> Dict:
+    result = agent.solve(
+        problem=item["problem"],
+        metadata={"idx": item["idx"]},
+    )
+    return build_output_record(item, result)
 
-    for item in read_jsonl(args.input_file):
-        idx = item.get("idx")
-        output_path = output_dir / f"{idx}.json"
-        if (
-            output_path.exists()
-            and output_path.stat().st_size > 0
-            and not args.overwrite
-        ):
-            print(f"skip idx={idx}: {output_path}")
-            continue
 
-        problem = item.get("problem", "")
-        metadata = {key: value for key, value in item.items() if key != "problem"}
+async def process_item(
+    agent: ReasoningAgent,
+    item: Dict,
+    output_dir: Path,
+    semaphore: asyncio.Semaphore,
+) -> None:
+    path = result_path(output_dir, item)
+    if is_processed(path):
+        print(f"Skip idx={item['idx']} because {path} already exists.")
+        return
+
+    async with semaphore:
         try:
-            result = agent.solve(problem=problem, metadata=metadata)
-            final_response = str(result.get("final_response", "")).strip()
-            if not final_response:
-                raise RuntimeError("Agent returned empty final_response")
-            output = {
-                "idx": idx,
-                "status": "success",
-                "final_response": final_response,
-                "trace": result.get("trace", []),
-            }
-        except Exception as exc:
-            output = {
-                "idx": idx,
+            record = await asyncio.to_thread(solve_item, agent, item)
+        except Exception as exc:  # noqa: BLE001 - keep one output file per input item.
+            record = {
+                "idx": item["idx"],
                 "status": "error",
                 "final_response": "",
                 "error": {
                     "type": type(exc).__name__,
                     "message": str(exc),
-                    "traceback": traceback.format_exc(limit=5),
                 },
                 "trace": [],
             }
+        await asyncio.to_thread(write_json, path, record)
+        print(f"Finished idx={item['idx']}")
 
-        write_json(output_path, output)
-        if output["status"] == "success":
-            print(f"idx={idx} final_response={output['final_response']}")
-        else:
-            print(f"idx={idx} error={output['error']['message']}")
-        print(f"wrote: {output_path}")
 
-    return 0
+async def run(args: argparse.Namespace) -> None:
+    input_path = Path(args.input_file)
+    output_dir = Path(args.output_dir)
+
+    items = load_jsonl(input_path)
+
+    client = InternChatClient()
+    agent = ReasoningAgent(client=client)
+    semaphore = asyncio.Semaphore(LOCAL_MAX_CONCURRENCY)
+
+    print(f"Loaded {len(items)} items. Max concurrency: {LOCAL_MAX_CONCURRENCY}.")
+    tasks = [process_item(agent, item, output_dir, semaphore) for item in items]
+    await asyncio.gather(*tasks)
+    print(f"Saved outputs to {output_dir}")
+
+
+def main() -> None:
+    asyncio.run(run(parse_args()))
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

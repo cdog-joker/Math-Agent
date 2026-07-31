@@ -7,6 +7,7 @@ __pycache__/
 venv/
 env/
 .env
+.DS_Store
 outputs/
 sample_outputs/
 dist/

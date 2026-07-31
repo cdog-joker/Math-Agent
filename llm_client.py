@@ -1,198 +1,130 @@
-"""Local Intern-S API client and demo fallback client.
-
-The official evaluator injects its own client into ``ReasoningAgent``.
-This module is only for local development.
-"""
-
-from __future__ import annotations
-
 import json
 import os
-import re
-import urllib.error
-import urllib.request
-from typing import Dict, List, Optional
+import time
+from typing import Any, Dict, List, Mapping, Optional, Union
 
-from utils.env_loader import load_dotenv
+import requests
+
+
+DEFAULT_API_BASE = "https://chat.intern-ai.org.cn/api/v1/chat/completions"
+DEFAULT_MODEL = "intern-s2-preview"
+DEFAULT_TEMPERATURE = 0.2
+DEFAULT_MAX_TOKENS = 4096
+
+ChatMessage = Dict[str, Any]
+ChatResponse = Union[str, ChatMessage]
+
+
+def load_dotenv(path: str = ".env") -> None:
+    """Load local environment variables without adding another dependency."""
+    if not os.path.exists(path):
+        return
+
+    with open(path, "r", encoding="utf-8") as file:
+        for raw_line in file:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip("'\"")
+            if key and key not in os.environ:
+                os.environ[key] = value
 
 
 class InternChatClient:
-    """Minimal OpenAI-compatible chat client for local testing."""
+    """Small OpenAI-compatible chat client for the competition sample."""
 
     def __init__(
         self,
-        api_key: Optional[str] = None,
-        model: Optional[str] = None,
-        api_base: Optional[str] = None,
         timeout: int = 120,
-        thinking_mode: Optional[bool] = None,
-    ):
-        self.api_key = api_key or os.getenv("INTERN_API_KEY", "")
-        self.model = model or os.getenv("INTERN_MODEL", "intern-s2-preview")
-        self.api_base = self._normalize_api_base(
-            api_base
-            or os.getenv("INTERN_API_BASE", "")
-            or "https://chat.intern-ai.org.cn/api/v1"
+        retry: int = 3,
+        default_args: Optional[Mapping[str, Any]] = None,
+        **request_args: Any,
+    ) -> None:
+        load_dotenv()
+        raw_api_key = os.environ.get("INTERN_API_KEY")
+        if not raw_api_key:
+            raise RuntimeError("Missing API key. Set INTERN_API_KEY.")
+        self.authorization = (
+            raw_api_key if raw_api_key.startswith("Bearer ") else f"Bearer {raw_api_key}"
         )
+        self.api_base = os.environ.get("INTERN_API_BASE", DEFAULT_API_BASE)
+        self.model = os.environ.get("INTERN_MODEL", DEFAULT_MODEL)
         self.timeout = timeout
-        self.thinking_mode = (
-            thinking_mode
-            if thinking_mode is not None
-            else _parse_optional_bool(os.getenv("INTERN_THINKING_MODE", ""))
-        )
+        self.retry = retry
+        self.default_args = dict(default_args or {})
+        thinking_mode = _parse_optional_bool(os.environ.get("INTERN_THINKING_MODE", ""))
+        if thinking_mode is not None:
+            self.default_args["thinking_mode"] = thinking_mode
+        self.default_args.update(request_args)
 
-        if not self.api_key:
-            raise RuntimeError("INTERN_API_KEY is not set")
+    def chat(
+        self,
+        messages: List[ChatMessage],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        *,
+        thinking_mode: Optional[bool] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        **request_args: Any,
+    ) -> ChatResponse:
+        """Create a chat completion.
 
-    def chat(self, messages: List[Dict[str, str]], temperature=0.2, max_tokens=4096):
+        Extra request arguments are passed through to the HTTP API. Arguments
+        supplied to ``chat`` override client-wide ``default_args``.
+
+        Text completions are returned as strings for backwards compatibility.
+        When the model requests a tool call, the complete assistant message is
+        returned so that callers can read ``tool_calls`` and append the message
+        to the next request.
+        """
         payload = {
             "model": self.model,
             "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
+            "temperature": DEFAULT_TEMPERATURE,
+            "max_tokens": DEFAULT_MAX_TOKENS,
         }
-        if self.thinking_mode is not None:
-            payload["thinking_mode"] = self.thinking_mode
+        payload.update(self.default_args)
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+        if thinking_mode is not None:
+            payload["thinking_mode"] = thinking_mode
+        if tools is not None:
+            payload["tools"] = tools
+        payload.update(request_args)
+        # ``messages`` is the only required per-call argument and must not be
+        # replaced accidentally by client-wide defaults.
+        payload["messages"] = messages
 
-        request = urllib.request.Request(
-            url=f"{self.api_base}/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Intern API HTTP {exc.code}: {body}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(
-                f"Intern API request failed: {exc}. "
-                f"Please check INTERN_API_BASE={self.api_base}"
-            ) from exc
-
-    @staticmethod
-    def _normalize_api_base(api_base: str) -> str:
-        base = api_base.rstrip("/")
-        suffix = "/chat/completions"
-        if base.endswith(suffix):
-            return base[: -len(suffix)]
-        return base
-
-
-class InternMessagesClient:
-    """Claude-like client for https://chat.intern-ai.org.cn/v1/messages."""
-
-    def __init__(
-        self,
-        api_key: Optional[str] = None,
-        api_url: Optional[str] = None,
-        model: Optional[str] = None,
-        timeout: int = 120,
-    ):
-        self.api_key = api_key or os.getenv("INTERN_API_KEY", "")
-        self.api_url = (
-            api_url
-            or os.getenv("INTERN_API_URL", "")
-            or os.getenv("INTERN_API_BASE", "")
-            or "https://chat.intern-ai.org.cn/v1/messages"
-        ).rstrip("/")
-        self.model = model or os.getenv("INTERN_MODEL", "intern-s1")
-        self.timeout = timeout
-
-        if self.api_url.endswith("/api/v1"):
-            self.api_url = self.api_url + "/chat/completions"
-        if not self.api_url.endswith("/v1/messages"):
-            self.api_url = "https://chat.intern-ai.org.cn/v1/messages"
-
-        if not self.api_key:
-            raise RuntimeError("INTERN_API_KEY is not set")
-
-    def chat(self, messages: List[Dict[str, str]], temperature=0.2, max_tokens=4096):
-        system_parts = []
-        normalized_messages = []
-        for message in messages:
-            role = message.get("role", "user")
-            content = message.get("content", "")
-            if role == "system":
-                system_parts.append(content)
-            else:
-                normalized_messages.append({"role": role, "content": content})
-
-        payload = {
-            "model": self.model,
-            "max_tokens": max_tokens,
-            "messages": normalized_messages,
-            "temperature": temperature,
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": self.authorization,
         }
-        if system_parts:
-            payload["system"] = "\n\n".join(system_parts)
 
-        request = urllib.request.Request(
-            url=self.api_url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "x-api-key": self.api_key,
-                "anthropic-version": "2023-06-01",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Intern Messages API HTTP {exc.code}: {body}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(
-                f"Intern Messages API request failed: {exc}. "
-                f"Please check INTERN_API_URL={self.api_url}"
-            ) from exc
+        last_error = None
+        for attempt in range(self.retry):
+            try:
+                response = requests.post(
+                    self.api_base,
+                    headers=headers,
+                    data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+                data = response.json()
+                message = data["choices"][0]["message"]
+                if "tool_calls" in message:
+                    return message
+                return message["content"]
+            except Exception as exc:  # noqa: BLE001 - keep sample robust and simple.
+                last_error = exc
+                if attempt + 1 < self.retry:
+                    time.sleep(2**attempt)
 
-
-class DemoRuleClient:
-    """Tiny offline client so the project can run before API credentials are set."""
-
-    def chat(self, messages: List[Dict[str, str]], temperature=0.2, max_tokens=4096):
-        text = "\n".join(message.get("content", "") for message in messages)
-
-        finite_field = re.search(r"F_\{?81\}?|mathbb\{F\}[_*]\{?81\}?", text)
-        generator_set = "F_3" in text or "mathbb{F}_3" in text
-        if finite_field and generator_set:
-            return (
-                "解题思路：F_81/F_3 的扩张次数为4。不能生成整个域的元素正好落在"
-                "真子域中；F_81 的真子域只有 F_3 与 F_9，其中 F_3 包含于 F_9。"
-                "因此生成元个数为 81-9=72。\n"
-                "校验：这些元素的最小多项式次数为4，正好生成 F_81。\n"
-                "FINAL_ANSWER: 72"
-            )
-
-        arithmetic = re.search(r"(\d+)\s*\+\s*(\d+)", text)
-        if arithmetic:
-            value = int(arithmetic.group(1)) + int(arithmetic.group(2))
-            return f"解题思路：直接相加。\n校验：计算无误。\nFINAL_ANSWER: {value}"
-
-        return (
-            "解题思路：当前未配置真实模型，本地DemoRuleClient无法可靠求解该题。\n"
-            "校验：请设置 INTERN_API_KEY 后使用 InternChatClient。\n"
-            "FINAL_ANSWER: 无法确定"
-        )
-
-
-def build_local_client():
-    load_dotenv()
-    if os.getenv("INTERN_API_KEY"):
-        style = os.getenv("INTERN_API_STYLE", "").strip().lower()
-        url = os.getenv("INTERN_API_URL", "") or os.getenv("INTERN_API_BASE", "")
-        if style in {"claude", "messages"} or url.rstrip("/").endswith("/v1/messages"):
-            return InternMessagesClient()
-        return InternChatClient()
-    return DemoRuleClient()
+        raise RuntimeError(f"Chat completion failed after {self.retry} attempts: {last_error}")
 
 
 def _parse_optional_bool(value: str) -> Optional[bool]:
