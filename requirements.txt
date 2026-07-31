@@ -1,0 +1,4 @@
+# The core demo only uses Python standard library modules.
+# Add optional packages here as the agent grows, for example:
+# sympy>=1.13.0
+# pytest>=8.0.0
